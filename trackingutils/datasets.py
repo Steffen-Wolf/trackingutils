@@ -15,17 +15,19 @@ class CTCDataWrapper():
     Features a h5 file conversion and buffer layer
     """
 
-    def __init__(self, root_folder, use_buffer=True):
+    def __init__(self, root_folder, use_buffer=True, load_3d=False):
         # create list of available image files
         self.root_folder = Path(root_folder)
         self.parse_root_folder()
         self._buffer = {}
+        self.load_3d = load_3d
         self.use_buffer = use_buffer
 
     def parse_root_folder(self):
 
         self.image_files = {}
         self.segmentation_files = []
+        self.tracking_files = []
         self.link_files = {}
 
         for data_folder in sorted(self.root_folder.glob("[0-9][0-9]")):
@@ -39,6 +41,10 @@ class CTCDataWrapper():
                 self.image_files[folder_number][t] = {}
                 self.image_files[folder_number][t]["raw_file"] = image_file
 
+                fg_file = data_folder.joinpath(f"t{t:03}_Probabilities.h5")
+                if fg_file.exists():
+                    self.image_files[folder_number][t]["fg_file"] = fg_file
+
                 # check for GT folder
                 gt_folder = self.root_folder.joinpath(f"{folder_number:02}_GT")
                 if gt_folder.exists():
@@ -46,7 +52,7 @@ class CTCDataWrapper():
                     if seg_file.exists():
                         self.image_files[folder_number][t]["has_segmentation"] = True
                         self.image_files[folder_number][t]["segmentation_file"] = seg_file
-                        self.segmentation_files.append((image_file, seg_file))
+                        self.segmentation_files.append((image_file, seg_file, (folder_number, t)))
 
                     fg_file = data_folder.joinpath(f"t{t:03}_Probabilities.h5")
 
@@ -56,6 +62,8 @@ class CTCDataWrapper():
                     tra_file = gt_folder.joinpath("TRA", f"man_track{t:03}.tif")
                     if tra_file.exists():
                         self.image_files[folder_number][t]["tracking_file"] = tra_file
+                        self.tracking_files.append((image_file, tra_file, (folder_number, t)))
+
 
             link_file = gt_folder.joinpath("TRA", f"man_track.txt")
             if link_file.exists():
@@ -69,6 +77,9 @@ class CTCDataWrapper():
 
     def len_segmentation(self):
         return len(self.segmentation_files)
+
+    def len_tracking(self):
+        return len(self.tracking_files)
 
     def len_images(self):
         number_of_images = 0
@@ -88,7 +99,10 @@ class CTCDataWrapper():
             or not self.use_buffer
 
         if load_from_file:
-            img = vigra.impex.readImage(str(file_name)).transpose(2, 1, 0)
+            if self.load_3d:
+                img = vigra.impex.readVolume(str(file_name)).transpose(3, 2, 1, 0)
+            else:
+                img = vigra.impex.readImage(str(file_name)).transpose(2, 1, 0)
             if normalize:
                 img -= img.mean()
                 img /= img.std()
@@ -101,12 +115,20 @@ class CTCDataWrapper():
         return img
 
     def get_segmentation(self, index, to_numpy=True):
-        rf, sf = self.segmentation_files[index]
+        rf, sf, _ = self.segmentation_files[index]
         if not to_numpy:
             return rf, sf
         else:
             return self.get_image(rf, buffer_name="raw", normalize=True), \
                 self.get_image(sf, buffer_name="seg")
+
+    def get_tracking(self, index, to_numpy=True):
+        rf, sf, _ = self.tracking_files[index]
+        if not to_numpy:
+            return rf, sf
+        else:
+            return self.get_image(rf, buffer_name="raw", normalize=True), \
+                self.get_image(sf, buffer_name="tra")
 
     def get_allimages(self, index, to_numpy=True):
 
