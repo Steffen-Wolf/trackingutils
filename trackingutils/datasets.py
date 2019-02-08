@@ -1,12 +1,81 @@
 from torch.utils.data import Dataset, DataLoader
+from inferno.io.core import Zip
 from inferno.io.transform import Compose
 from inferno.io.transform.generic import AsTorchBatch
 from inferno.io.transform.image import RandomFlip, RandomCrop
+from inferno.io.transform.generic import Normalize
 from inferno.io.transform.image import RandomRotate, ElasticTransform
+from neurofire.transform.affinities import Segmentation2Affinities2D, Segmentation2Affinities
+from inferno.io.volumetric import LazyHDF5VolumeLoader, HDF5VolumeLoader
+from neurofire.criteria.loss_transforms import MaskTransitionToIgnoreLabel
+from neurofire.criteria.loss_transforms import InvertTarget
 from pathlib import Path
 import h5py
 import numpy as np
 import vigra
+
+
+def get_transforms(transforms, dim, output_size, crop=True):
+    if transforms == 'all':
+        transform = Compose(RandomFlip(),
+                            RandomRotate(),
+                            ElasticTransform(alpha=2000., sigma=50., order=0))
+        if crop:
+            transform.add(RandomCrop(output_size))
+        transform.add(AsTorchBatch(dim))
+
+    elif transforms == 'all_affinities':
+
+        offsets = [[-1, 0], [0, -1],
+                   [-9, 0], [0, -9],
+                   [-9, -9], [9, -9],
+                   [-9, -4], [-4, -9], [4, -9], [9, -4],
+                   [-27, 0], [0, -27]]
+
+        transform = Compose(RandomFlip(),
+                            RandomRotate(),
+                            ElasticTransform(alpha=2000., sigma=50., order=0),
+                            Segmentation2Affinities2D(offsets=offsets,
+                                                      segmentation_to_binary=True,
+                                                      apply_to=[1],
+                                                      ignore_label=-1),
+                            InvertTarget())
+        if crop:
+            transform.add(RandomCrop(output_size))
+        transform.add(AsTorchBatch(dim))
+
+    elif transforms == 'tracking_affinities':
+
+        offsets = [[-1, 0, 0], [0, -1, 0], [0, 0, -1],
+                   [-1, 0, -9], [-1, -9, 0], [-2, 0, 0],
+                   [0, -9, 0], [0, 0, -9],
+                   [0, -9, -9], [0, 9, -9],
+                   [0, -9, -4], [0, -4, -9], [0, 4, -9], [0, 9, -4],
+                   [0, -27, 0], [0, 0, -27]]
+
+        transform = Compose(RandomFlip(),
+                            RandomRotate(),
+                            Normalize(apply_to=[0]),
+                            ElasticTransform(alpha=2000., sigma=50., order=0),
+                            Segmentation2Affinities(offsets=offsets,
+                                                      segmentation_to_binary=True,
+                                                      apply_to=[1],
+                                                      ignore_label=-1,
+                                                      retain_segmentation=True))
+        if crop:
+            transform.add(RandomCrop(output_size))
+        transform.add(AsTorchBatch(dim))
+
+    elif transforms == 'minimal':
+        transform = Compose()
+        if crop:
+            transform.add(AsTorchBatch(dim))
+    elif transforms == "no":
+        transform = None
+    else:
+        raise NotImplementedError()
+
+    return transform
 
 
 class CTCDataWrapper():
@@ -27,7 +96,9 @@ class CTCDataWrapper():
 
         self.image_files = {}
         self.segmentation_files = []
+        self.fgbg_files = []
         self.tracking_files = []
+        self.allimages = []
         self.link_files = {}
 
         for data_folder in sorted(self.root_folder.glob("[0-9][0-9]")):
@@ -40,10 +111,12 @@ class CTCDataWrapper():
                 t = int(image_file.name[1:4])
                 self.image_files[folder_number][t] = {}
                 self.image_files[folder_number][t]["raw_file"] = image_file
+                self.allimages.append((folder_number, t))
 
                 fg_file = data_folder.joinpath(f"t{t:03}_Probabilities.h5")
                 if fg_file.exists():
                     self.image_files[folder_number][t]["fg_file"] = fg_file
+                    self.fgbg_files.append((image_file, fg_file, (folder_number, t)))
 
                 # check for GT folder
                 gt_folder = self.root_folder.joinpath(f"{folder_number:02}_GT")
@@ -64,7 +137,6 @@ class CTCDataWrapper():
                         self.image_files[folder_number][t]["tracking_file"] = tra_file
                         self.tracking_files.append((image_file, tra_file, (folder_number, t)))
 
-
             link_file = gt_folder.joinpath("TRA", f"man_track.txt")
             if link_file.exists():
                 self.link_files[folder_number] = link_file
@@ -81,6 +153,9 @@ class CTCDataWrapper():
     def len_tracking(self):
         return len(self.tracking_files)
 
+    def len_fgbg_files(self):
+        return len(self.fgbg_files)
+
     def len_images(self):
         number_of_images = 0
         for folder in self.image_files:
@@ -88,22 +163,29 @@ class CTCDataWrapper():
 
         return number_of_images
 
-    def get_image(self, file_name, buffer_name=None, normalize=False):
+    def get_image(self, file_name, buffer_name=None, normalize=False, h5=False):
         # create new buffer dictionary if it does not exist
         if self.use_buffer:
             if buffer_name not in self._buffer:
                 self._buffer[buffer_name] = {}
 
-        inbuffer = file_name in self._buffer[buffer_name]
+            inbuffer = file_name in self._buffer[buffer_name]
+
         load_from_file = (self.use_buffer and not inbuffer) \
             or not self.use_buffer
 
         if load_from_file:
-            if self.load_3d:
-                img = vigra.impex.readVolume(str(file_name)).transpose(3, 2, 1, 0)
+            if h5:
+                with h5py.File(file_name, "r") as h5file:
+                    img = h5file["exported_data"][..., 1]
             else:
-                img = vigra.impex.readImage(str(file_name)).transpose(2, 1, 0)
+                if self.load_3d:
+                    img = vigra.impex.readVolume(str(file_name)).transpose(3, 2, 1, 0)
+                else:
+                    img = vigra.impex.readImage(str(file_name)).transpose(2, 1, 0)
+
             if normalize:
+                # img /= 255.
                 img -= img.mean()
                 img /= img.std()
 
@@ -133,17 +215,12 @@ class CTCDataWrapper():
     def get_allimages(self, index, to_numpy=True):
 
         # find folder matching to index
-        remaining_index = int(index)
-        for folder in self.image_files:
-            if remaining_index > len(self.image_files[folder]):
-                remaining_index -= len(self.image_files[folder])
-            else:
-                break
+        folder, t = self.allimages[index]
 
-        rf = self.image_files[folder][remaining_index]["raw_file"]
+        rf = self.image_files[folder][t]["raw_file"]
         sf = None
-        if self.image_files[folder][remaining_index]["has_segmentation"]:
-            sf = self.image_files[folder][remaining_index]["segmentation_file"]
+        if "has_segmentation" in self.image_files[folder][t]:
+            sf = self.image_files[folder][t]["segmentation_file"]
 
         if not to_numpy:
             return rf, sf
@@ -159,6 +236,24 @@ class CTCDataWrapper():
 
             return img, seg
 
+    def get_fgbg_images(self, index, length=1):
+        if length > 1:
+            # shift index if the sequence would bridge two folders
+            index = min(index, len(self.fgbg_files) - length)
+            ref = self.fgbg_files[index][2]
+            folders = [self.fgbg_files[index + l][2] == ref for l in range(length)]
+
+            if np.sum(folders) < len(folders):
+                index = index - len(folders) + np.sum(folders)
+
+            images = [self.get_fgbg_images(index + l, length=1) for l in range(length)]
+            return np.concatenate([img[0] for img in images]), \
+                np.stack([img[1] for img in images])
+
+        rf, fgfile, _ = self.fgbg_files[index]
+        return self.get_image(rf, buffer_name="raw", normalize=True), \
+            self.get_image(fgfile, buffer_name="fg", h5=True)
+
 
 class CTCSegmentationDataset(Dataset):
     """
@@ -169,27 +264,14 @@ class CTCSegmentationDataset(Dataset):
     def __init__(self, root_folder,
                  output_size=(128, 128),
                  transforms='all',
-                 use_buffer=True):
+                 use_buffer=True,
+                 dim=2):
 
         self.data = CTCDataWrapper(root_folder,
-                                   use_buffer=use_buffer)
+                                   use_buffer=use_buffer,
+                                   load_3d=(dim == 3))
 
-        if transforms == 'all':
-            self.transform = Compose(RandomFlip(),
-                                     RandomRotate(),
-                                     ElasticTransform(alpha=2000., sigma=50., order=0),
-                                     RandomCrop(output_size),
-                                     AsTorchBatch(2))
-        elif transforms == 'minimal':
-            self.transform = Compose(RandomFlip(),
-                                     RandomRotate(),
-                                     RandomCrop(output_size),
-                                     AsTorchBatch(2))
-        elif transforms == 'no':
-            self.transform = None
-        else:
-            self.transform = Compose(RandomCrop(output_size),
-                                     AsTorchBatch(2))
+        self.transform = get_transforms(transforms, dim, output_size)
 
         self.output_size = output_size
 
@@ -201,10 +283,24 @@ class CTCSegmentationDataset(Dataset):
         img, gt = img.astype(np.float32), gt.astype(np.float32)
         if self.transform is not None:
             img, gt = self.transform(img, gt)
-        return img, gt
+
+        return img[0], gt[0]
 
 
-class CTCSemisupervisedSegmentationDataset(CTCSegmentationDataset):
+class CTCDataset(CTCSegmentationDataset):
+
+    def __len__(self):
+        return self.data.len_images()
+
+    def __getitem__(self, idx):
+        img, gt = self.data.get_allimages(idx)
+        img = img.astype(np.float32)
+        if self.transform is not None:
+            img = self.transform(img)
+        return img
+
+
+class CTCSemisupervisedSegmentationDataset(CTCDataset):
     """
     Pytorch dataset for the cell tracking challenge
     loading segmentations only
@@ -282,26 +378,138 @@ class CTCSemisupervisedSegmentationDataset(CTCSegmentationDataset):
         for i, key in enumerate(shape_feats):
             self.means[i] = np.mean(shape_feats[key])
             self.stds[i] = np.std(shape_feats[key])
-        import pdb
-        pdb.set_trace()
 
         del shape_feats
+
+
+class CTCFgBgDataset(CTCSegmentationDataset):
+    """
+    Pytorch dataset for the cell tracking challenge
+    loading segmentations only
+    """
+
+    def __init__(self, *args, npairs=1, **kwargs):
+        self.npairs = npairs
+        # if npairs > 1:
+        #     for folder_number in self.image_files.keys():
+        #         self.indices.extend(list(image_files[t][:-npairs]))
+        super(CTCFgBgDataset, self).__init__(*args, **kwargs)
 
     def __len__(self):
         return self.data.len_images()
 
     def __getitem__(self, idx):
-        img, gt = self.data.get_allimages(idx)
+        img, fg = self.data.get_fgbg_images(idx, length=self.npairs)
+        img, fg = img.astype(np.float32), fg.astype(np.float32)
+        print(img.shape, fg.shape)
+        if self.transform is not None:
+            img, fg = self.transform(img, fg)
+        if self.npairs > 1:
+            return img, np.stack((img, fg), axis=1)
+        else:
+            return img, np.concatenate((img, fg), axis=0)
+
+
+class CTCSyntheticDataset(Dataset):
+
+    def __init__(self,
+                 root_folder,
+                 output_size=(128, 128),
+                 dim=2,
+                 transforms='all',
+                 **kwargs):
+
+        self.transform = get_transforms(transforms, dim, output_size)
+        self.output_size = output_size
+
+    def __len__(self):
+        # return a random number since we are generating new images anyway
+        return 1000
+
+    def __getitem__(self, idx):
+
+        img = self.generate_image()
+        img, gt = self.data.get_segmentation(idx)
         img, gt = img.astype(np.float32), gt.astype(np.float32)
+
         if self.transform is not None:
             img, gt = self.transform(img, gt)
-        return img, gt, img, self.means, self.stds
+
+        return img, gt
+
+
+# TODO: move this into inferno???
+class MergeDataset(Dataset):
+
+    def __init__(self, *datasets):
+        self.datasets = tuple(*datasets)
+
+    def __len__(self):
+        # return a random number since we are generating new images anyway
+        return sum(len(d) for d in self.datasets)
+
+    def index_to_ds_subindex(self, index):
+        d_idx = 0
+        while (index >= len(self.datasets[d_idx])):
+            index -= len(self.datasets[d_idx])
+            d_idx += 1
+        return d_idx, index
+
+    def __getitem__(self, idx):
+        d_idx, sub_idx = self.index_to_ds_subindex(idx)
+        return self.datasets[d_idx].__getitem__(sub_idx)
+
+
+class CTCAffinityDataset(Zip):
+
+    def __init__(self, root_folder, h5file, shape, dim, transforms='all_affinities'):
+        data_filename = str(Path(root_folder).joinpath(h5file))
+
+        with h5py.File(data_filename, "r") as h5file:
+            folders = [k for k in h5file.keys()]
+
+        raw_ds = MergeDataset(
+            HDF5VolumeLoader(data_filename, f'{f}/raw',
+                                                 window_size=shape,
+                                                 stride=[1, 1, 1],
+                                                 padding=None,
+                                                 padding_mode='constant')
+            for f in folders)
+
+        segmentatoin_ds = MergeDataset(
+            HDF5VolumeLoader(data_filename, f'{f}/tracklet_seg',
+                                                 window_size=shape,
+                                                 stride=[1, 1, 1],
+                                                 padding=None,
+                                                 padding_mode='constant')
+            for f in folders)
+
+        self.transform = get_transforms(transforms, dim, None, crop=False)
+
+        super(CTCAffinityDataset, self).__init__(raw_ds, segmentatoin_ds)
+
+    def __getitem__(self, idx):
+
+        img, gt = super(CTCAffinityDataset, self).__getitem__(idx)
+
+        if self.transform is not None:
+            img, gt = self.transform(img, gt.astype(np.int64))
+
+        return img, gt
 
 
 if __name__ == '__main__':
-    ds = CTCSegmentationDataset("/mnt/data1/swolf/CTC/Fluo-N3DH-SIM")
+
+    shape = [8, 512, 512]
+    ds = CTCAffinityDataset("/mnt/data1/swolf/CTC/DIC-C2DH-HeLa",
+                            "data.h5",
+                            shape,
+                            3)
 
     print("start")
     for epoch in range(10):
-        for i, (img, seg) in enumerate(ds):
-            print(i, len(ds))
+        for i, img in enumerate(ds):
+            print(img)
+            with h5py.File("debug.h5", "w") as h5file:
+                h5file.create_dataset("img0", data=img[0])
+                h5file.create_dataset("img1", data=img[1])
