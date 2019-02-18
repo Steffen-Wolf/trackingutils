@@ -85,15 +85,20 @@ class CTCDataWrapper():
     """
     Provides a unified access method for the tiff files in the CTC
     Features a h5 file conversion and buffer layer
+
+    Parameters:
+    slice_z: set this parameter to True if the GT only provides only 
+             segmentation slices
     """
 
-    def __init__(self, root_folder, use_buffer=True, load_3d=False):
+    def __init__(self, root_folder, use_buffer=True, slice_z=False, load_3d=False):
         # create list of available image files
         self.root_folder = Path(root_folder)
-        self.parse_root_folder()
         self._buffer = {}
         self.load_3d = load_3d
+        self.slice_z = slice_z
         self.use_buffer = use_buffer
+        self.parse_root_folder()
 
     def parse_root_folder(self):
 
@@ -124,11 +129,19 @@ class CTCDataWrapper():
                 # check for GT folder
                 gt_folder = self.root_folder.joinpath(f"{folder_number:02}_GT")
                 if gt_folder.exists():
-                    seg_file = gt_folder.joinpath("SEG", f"man_seg{t:03}.tif")
-                    if seg_file.exists():
-                        self.image_files[folder_number][t]["has_segmentation"] = True
-                        self.image_files[folder_number][t]["segmentation_file"] = seg_file
-                        self.segmentation_files.append((image_file, seg_file, (folder_number, t)))
+                    if not self.slice_z:
+                        seg_file = gt_folder.joinpath("SEG", f"man_seg{t:03}.tif")
+                        if seg_file.exists():
+                            self.image_files[folder_number][t]["has_segmentation"] = True
+                            self.image_files[folder_number][t]["segmentation_file"] = seg_file
+                            self.segmentation_files.append((image_file, seg_file, (folder_number, t)))
+                    else:
+                        seg_slice_file = gt_folder.joinpath("SEG").glob(f"man_seg_{t:03}_[0-9][0-9][0-9].tif")
+                        for seg_slice in seg_slice_file:
+                            z = int(str(seg_slice).split("_")[-1][:3])
+                            self.image_files[folder_number][t]["has_segmentation"] = True
+                            self.image_files[folder_number][t]["segmentation_file"] = seg_slice
+                            self.segmentation_files.append((image_file, seg_slice, (folder_number, t, z)))
 
                     fg_file = data_folder.joinpath(f"t{t:03}_Probabilities.h5")
 
@@ -144,11 +157,12 @@ class CTCDataWrapper():
             if link_file.exists():
                 self.link_files[folder_number] = link_file
 
-    @property
-    def segmentation(self, to_numpy=True, use_buffer=True):
-        for i in range(self.len_segmentation()):
-            yield self.get_segmentation(i,
-                                        to_numpy=to_numpy)
+    # TODO: test if this is truly depreciated
+    # @property
+    # def segmentation(self, to_numpy=True, use_buffer=True):
+    #     for i in range(self.len_segmentation()):
+    #         yield self.get_segmentation(i,
+    #                                     to_numpy=to_numpy)
 
     def len_segmentation(self):
         return len(self.segmentation_files)
@@ -166,7 +180,8 @@ class CTCDataWrapper():
 
         return number_of_images
 
-    def get_image(self, file_name, buffer_name=None, normalize=False, h5=False):
+    def get_image(self, file_name, buffer_name=None,
+                  normalize=False, h5=False, select_z=None):
         # create new buffer dictionary if it does not exist
         if self.use_buffer:
             if buffer_name not in self._buffer:
@@ -187,6 +202,9 @@ class CTCDataWrapper():
                 else:
                     img = vigra.impex.readImage(str(file_name)).transpose(2, 1, 0)
 
+            if select_z is not None:
+                img = img[:, select_z]
+
             if normalize:
                 # img /= 255.
                 img -= img.mean()
@@ -200,12 +218,23 @@ class CTCDataWrapper():
         return img
 
     def get_segmentation(self, index, to_numpy=True):
-        rf, sf, _ = self.segmentation_files[index]
-        if not to_numpy:
-            return rf, sf
+        rf, sf, position = self.segmentation_files[index]
+        if len(position) == 3 and self.slice_z:
+            select_z = position[2]
+            seg_select_z = 0
         else:
-            return self.get_image(rf, buffer_name="raw", normalize=True), \
-                self.get_image(sf, buffer_name="seg")
+            select_z = None
+            seg_select_z = None
+
+        if not to_numpy:
+            return rf, sf, position
+        else:
+            return self.get_image(rf,
+                                  buffer_name="raw",
+                                  normalize=True,
+                                  select_z=select_z), \
+                self.get_image(sf, buffer_name="seg",
+                               select_z=seg_select_z)
 
     def get_tracking(self, index, to_numpy=True):
         rf, sf, _ = self.tracking_files[index]
@@ -268,11 +297,13 @@ class CTCSegmentationDataset(Dataset):
                  output_size=(128, 128),
                  transforms='all',
                  use_buffer=True,
+                 slice_z=False,
                  dim=2):
 
         self.data = CTCDataWrapper(root_folder,
                                    use_buffer=use_buffer,
-                                   load_3d=(dim == 3))
+                                   load_3d=(dim == 3),
+                                   slice_z=slice_z)
 
         self.transform = get_transforms(transforms, dim, output_size)
 
@@ -332,7 +363,7 @@ class CTCSemisupervisedSegmentationDataset(CTCDataset):
 
         for i in range(self.data.len_segmentation()):
 
-            img, seg = self.data.get_segmentation(i)
+            img, seg, _ = self.data.get_segmentation(i)
 
             if coord_np is None:
                 coord_np = np.mgrid[:img.shape[1], :img.shape[2]][:, :, :]
@@ -432,7 +463,7 @@ class CTCSyntheticDataset(Dataset):
     def __getitem__(self, idx):
 
         img = self.generate_image()
-        img, gt = self.data.get_segmentation(idx)
+        img, gt, _ = self.data.get_segmentation(idx)
         img, gt = img.astype(np.float32), gt.astype(np.float32)
 
         if self.transform is not None:
@@ -506,16 +537,24 @@ class CTCAffinityDataset(Zip):
 
 if __name__ == '__main__':
 
-    shape = [8, 512, 512]
-    ds = CTCAffinityDataset("/mnt/data1/swolf/CTC/DIC-C2DH-HeLa",
-                            "data.h5",
-                            shape,
-                            3)
+    ds = CTCSegmentationDataset("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC",
+                                dim=3,
+                                slice_z=True,
+                                output_size=(512, 512))
 
-    print("start")
-    for epoch in range(10):
-        for i, img in enumerate(ds):
-            print(img)
-            with h5py.File("debug.h5", "w") as h5file:
-                h5file.create_dataset("img0", data=img[0])
-                h5file.create_dataset("img1", data=img[1])
+    print("ds size ", len(ds))
+    for i, (img, seg) in enumerate(ds):
+        print(img.shape, seg.shape)
+    # shape = [8, 512, 512]
+    # ds = CTCAffinityDataset("/mnt/data1/swolf/CTC/DIC-C2DH-HeLa",
+    #                         "data.h5",
+    #                         shape,
+    #                         3)
+
+    # print("start")
+    # for epoch in range(10):
+    #     for i, img in enumerate(ds):
+    #         print(img)
+    #         with h5py.File("debug.h5", "w") as h5file:
+    #             h5file.create_dataset("img0", data=img[0])
+    #             h5file.create_dataset("img1", data=img[1])
