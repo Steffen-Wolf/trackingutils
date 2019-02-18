@@ -47,23 +47,26 @@ def get_transforms(transforms, dim, output_size, crop=True):
     elif transforms == 'tracking_affinities':
 
         offsets = [[-1, 0, 0], [0, -1, 0], [0, 0, -1],
-                   [-1, 0, -9], [-1, -9, 0], [-2, 0, 0],
+                   [-1, -4, -4], [-1, 4, 4],
+                   [-1, -4, 4], [-1, 4, -4],
+                   [-2, 0, 0],
                    [0, -9, 0], [0, 0, -9],
                    [0, -9, -9], [0, 9, -9],
                    [0, -9, -4], [0, -4, -9], [0, 4, -9], [0, 9, -4],
-                   [0, -27, 0], [0, 0, -27]]
+                   [0, -27, 0], [0, 0, -27], [0, -81, 0], [0, 0, -81]]
 
         transform = Compose(RandomFlip(),
                             RandomRotate(),
                             Normalize(apply_to=[0]),
                             ElasticTransform(alpha=2000., sigma=50., order=0),
                             Segmentation2Affinities(offsets=offsets,
-                                                      segmentation_to_binary=True,
-                                                      apply_to=[1],
-                                                      ignore_label=-1,
-                                                      retain_segmentation=True))
+                                                    segmentation_to_binary=True,
+                                                    apply_to=[1],
+                                                    ignore_label=-1,
+                                                    retain_segmentation=True))
         if crop:
             transform.add(RandomCrop(output_size))
+
         transform.add(AsTorchBatch(dim))
 
     elif transforms == 'minimal':
@@ -462,26 +465,29 @@ class MergeDataset(Dataset):
 
 class CTCAffinityDataset(Zip):
 
-    def __init__(self, root_folder, h5file, shape, dim, transforms='all_affinities'):
+    def __init__(self, root_folder, h5file, shape,
+                 dim, folders=None, transforms='all_affinities'):
+
         data_filename = str(Path(root_folder).joinpath(h5file))
 
-        with h5py.File(data_filename, "r") as h5file:
-            folders = [k for k in h5file.keys()]
+        if folders is None:
+            with h5py.File(data_filename, "r") as h5file:
+                folders = [k for k in h5file.keys()]
 
         raw_ds = MergeDataset(
             HDF5VolumeLoader(data_filename, f'{f}/raw',
-                                                 window_size=shape,
-                                                 stride=[1, 1, 1],
-                                                 padding=None,
-                                                 padding_mode='constant')
+                             window_size=shape,
+                             stride=[1, 1, 1],
+                             padding=None,
+                             padding_mode='constant')
             for f in folders)
 
         segmentatoin_ds = MergeDataset(
             HDF5VolumeLoader(data_filename, f'{f}/tracklet_seg',
-                                                 window_size=shape,
-                                                 stride=[1, 1, 1],
-                                                 padding=None,
-                                                 padding_mode='constant')
+                             window_size=shape,
+                             stride=[1, 1, 1],
+                             padding=None,
+                             padding_mode='constant')
             for f in folders)
 
         self.transform = get_transforms(transforms, dim, None, crop=False)
