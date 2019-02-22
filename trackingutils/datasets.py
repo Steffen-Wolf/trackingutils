@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset, DataLoader
-from inferno.io.core import Zip
+from inferno.io.core import Zip, ZipReject
 from inferno.io.transform import Compose
 from inferno.io.transform.generic import AsTorchBatch
 from inferno.io.transform.image import RandomFlip, RandomCrop
@@ -9,8 +9,11 @@ from neurofire.transform.affinities import Segmentation2Affinities2D, Segmentati
 from inferno.io.volumetric import LazyHDF5VolumeLoader, HDF5VolumeLoader
 from neurofire.criteria.loss_transforms import MaskTransitionToIgnoreLabel
 from neurofire.criteria.loss_transforms import InvertTarget
+from embeddingutils.transforms import Segmentation2AffinitiesWithPadding
 from pathlib import Path
+from .transforms import SliceTransform
 import h5py
+import torch
 import numpy as np
 import vigra
 
@@ -69,6 +72,36 @@ def get_transforms(transforms, dim, output_size, crop=True):
 
         transform.add(AsTorchBatch(dim))
 
+    elif transforms == '3D_tracking_affinities':
+
+        offsets = [[-1, 0, 0, 0], [0, -1, 0, 0],
+                   [0, 0, -1, 0], [0, 0, 0, -1],
+                   [-1, 0, -4, -4], [-1, 0, 4, 4],
+                   [-1, 0, -4, 4], [-1, 0, 4, -4],
+                   [0, -1, -4, -4], [0, -1, 4, 4],
+                   [0, -1, -4, 4], [0, -1, 4, -4],
+                   [0, -2, 0, 0],
+                   [0, 0, -9, 0], [0, 0, 0, -9],
+                   [0, 0, -9, -9], [0, 0, 9, -9],
+                   [0, 0, -9, -4], [0, 0, -4, -9],
+                   [0, 0, 4, -9], [0, 0, 9, -4],
+                   [0, 0, -27, 0], [0, 0, 0, -27]]
+
+        transform = Compose(RandomFlip(),
+                            RandomRotate(),
+                            Normalize(apply_to=[0]),
+                            ElasticTransform(alpha=2000., sigma=50., order=0),
+                            Segmentation2AffinitiesWithPadding(offsets=offsets,
+                                                               segmentation_to_binary=True,
+                                                               apply_to=[1],
+                                                               ignore_label=-1,
+                                                               retain_segmentation=False),
+                            SliceTransform(2, 1, apply_to=[1]))
+        if crop:
+            transform.add(RandomCrop(output_size))
+
+        transform.add(AsTorchBatch(dim))
+
     elif transforms == 'minimal':
         transform = Compose()
         if crop:
@@ -87,17 +120,20 @@ class CTCDataWrapper():
     Features a h5 file conversion and buffer layer
 
     Parameters:
-    slice_z: set this parameter to True if the GT only provides only 
+    slice_z: set this parameter to True if the GT only provides only
              segmentation slices
     """
 
-    def __init__(self, root_folder, use_buffer=True, slice_z=False, load_3d=False):
+    def __init__(self, root_folder, use_buffer=True, normalize=True,
+                 slice_z=False, load_3d=False, folders=None):
         # create list of available image files
         self.root_folder = Path(root_folder)
         self._buffer = {}
         self.load_3d = load_3d
         self.slice_z = slice_z
         self.use_buffer = use_buffer
+        self.folders = folders
+        self.normalize = normalize
         self.parse_root_folder()
 
     def parse_root_folder(self):
@@ -110,6 +146,10 @@ class CTCDataWrapper():
         self.link_files = {}
 
         for data_folder in sorted(self.root_folder.glob("[0-9][0-9]")):
+
+            if self.folders is not None and data_folder.name not in self.folders:
+                continue
+
             folder_number = int(data_folder.name)
             # print(data_folder.name, folder_number)
             self.image_files[folder_number] = {}
@@ -231,7 +271,7 @@ class CTCDataWrapper():
         else:
             return self.get_image(rf,
                                   buffer_name="raw",
-                                  normalize=True,
+                                  normalize=self.normalize,
                                   select_z=select_z), \
                 self.get_image(sf, buffer_name="seg",
                                select_z=seg_select_z)
@@ -257,7 +297,7 @@ class CTCDataWrapper():
         if not to_numpy:
             return rf, sf
         else:
-            img = self.get_image(rf, buffer_name="raw", normalize=True)
+            img = self.get_image(rf, buffer_name="raw", normalize=self.normalize)
 
             if sf is not None:
                 seg = self.get_image(sf, buffer_name="seg")
@@ -298,14 +338,18 @@ class CTCSegmentationDataset(Dataset):
                  transforms='all',
                  use_buffer=True,
                  slice_z=False,
+                 folders=None,
+                 normalize=True,
                  dim=2):
 
         self.data = CTCDataWrapper(root_folder,
                                    use_buffer=use_buffer,
                                    load_3d=(dim == 3),
-                                   slice_z=slice_z)
+                                   slice_z=slice_z,
+                                   normalize=normalize,
+                                   folders=folders)
 
-        self.transform = get_transforms(transforms, dim, output_size)
+        self.transform = get_transforms(transforms, dim, output_size, False)
 
         self.output_size = output_size
 
@@ -472,6 +516,16 @@ class CTCSyntheticDataset(Dataset):
         return img, gt
 
 
+class RejectFewInstances(object):
+
+    def __init__(self, threshold):
+        self.threshold = threshold
+
+    def __call__(self, fetched):
+        ratio = ((fetched > 0).sum() / fetched.size)
+        return ratio < self.threshold
+
+
 # TODO: move this into inferno???
 class MergeDataset(Dataset):
 
@@ -494,10 +548,10 @@ class MergeDataset(Dataset):
         return self.datasets[d_idx].__getitem__(sub_idx)
 
 
-class CTCAffinityDataset(Zip):
+class CTCAffinityDataset(ZipReject):
 
-    def __init__(self, root_folder, h5file, shape,
-                 dim, folders=None, transforms='all_affinities'):
+    def __init__(self, root_folder, h5file, shape, dim, use_time_as_channels=False, stride=None,
+                 rejection_threshold=0.001, folders=None, transforms='all_affinities'):
 
         data_filename = str(Path(root_folder).joinpath(h5file))
 
@@ -505,25 +559,37 @@ class CTCAffinityDataset(Zip):
             with h5py.File(data_filename, "r") as h5file:
                 folders = [k for k in h5file.keys()]
 
+        if stride is None:
+            stride = [max(s // 2, 1) for s in shape]
+
         raw_ds = MergeDataset(
-            HDF5VolumeLoader(data_filename, f'{f}/raw',
-                             window_size=shape,
-                             stride=[1, 1, 1],
-                             padding=None,
-                             padding_mode='constant')
+            LazyHDF5VolumeLoader(data_filename, f'{f}/raw',
+                                 window_size=shape,
+                                 stride=stride,
+                                 padding=None,
+                                 padding_mode='constant')
             for f in folders)
 
         segmentatoin_ds = MergeDataset(
-            HDF5VolumeLoader(data_filename, f'{f}/tracklet_seg',
-                             window_size=shape,
-                             stride=[1, 1, 1],
-                             padding=None,
-                             padding_mode='constant')
+            LazyHDF5VolumeLoader(data_filename, f'{f}/tracklet_seg',
+                                 window_size=shape,
+                                 stride=stride,
+                                 padding=None,
+                                 padding_mode='constant')
             for f in folders)
 
-        self.transform = get_transforms(transforms, dim, None, crop=False)
+        batch_dim = dim
+        if use_time_as_channels:
+            batch_dim -= 1
 
-        super(CTCAffinityDataset, self).__init__(raw_ds, segmentatoin_ds)
+        self.use_time_as_channels = use_time_as_channels
+
+        self.transform = get_transforms(transforms, batch_dim, None, crop=False)
+
+        super(CTCAffinityDataset, self).__init__(raw_ds, segmentatoin_ds,
+                                                 rejection_dataset_indices=1,
+                                                 rejection_criterion=RejectFewInstances(rejection_threshold),
+                                                 sync=True)
 
     def __getitem__(self, idx):
 
@@ -532,24 +598,34 @@ class CTCAffinityDataset(Zip):
         if self.transform is not None:
             img, gt = self.transform(img, gt.astype(np.int64))
 
-        return img, gt
+        return img.type(torch.FloatTensor), gt.type(torch.FloatTensor)
 
 
 if __name__ == '__main__':
 
-    ds = CTCSegmentationDataset("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC",
-                                dim=3,
-                                slice_z=True,
-                                output_size=(512, 512))
+    # ds = CTCSegmentationDataset("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC",
+    #                             dim=3,
+    #                             slice_z=True,
+    #                             output_size=(512, 512))
 
-    print("ds size ", len(ds))
-    for i, (img, seg) in enumerate(ds):
-        print(img.shape, seg.shape)
+    # print("ds size ", len(ds))
+    # for i, (img, seg) in enumerate(ds):
+    #     print(img.shape, seg.shape)
     # shape = [8, 512, 512]
-    # ds = CTCAffinityDataset("/mnt/data1/swolf/CTC/DIC-C2DH-HeLa",
-    #                         "data.h5",
-    #                         shape,
-    #                         3)
+
+    HDF5VolumeLoader("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC/data.h5", '02/raw',
+                     window_size=[4, 13, 256, 256],
+                     stride=[1, 1, 128, 128],
+                     padding=None,
+                     padding_mode='constant')
+
+    # ds = CTCAffinityDataset("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC",
+    #                         shape=[4, 13, 256, 256],
+    #                         dim=4,
+    #                         h5file="data.h5",
+    #                         folders=['02'],
+    #                         transforms='tracking_affinities',
+    #                         use_time_as_channels=True)
 
     # print("start")
     # for epoch in range(10):
