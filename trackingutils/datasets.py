@@ -6,7 +6,7 @@ from inferno.io.transform.image import RandomFlip, RandomCrop
 from inferno.io.transform.generic import Normalize
 from inferno.io.transform.image import RandomRotate, ElasticTransform
 from neurofire.transform.affinities import Segmentation2Affinities2D, Segmentation2Affinities
-from inferno.io.volumetric import LazyHDF5VolumeLoader, HDF5VolumeLoader
+from inferno.io.volumetric import LazyHDF5VolumeLoader, HDF5VolumeLoader, LazyN5VolumeLoader
 from neurofire.criteria.loss_transforms import MaskTransitionToIgnoreLabel
 from neurofire.criteria.loss_transforms import InvertTarget
 from embeddingutils.transforms import Segmentation2AffinitiesWithPadding
@@ -551,7 +551,7 @@ class MergeDataset(Dataset):
 class CTCAffinityDataset(ZipReject):
 
     def __init__(self, root_folder, h5file, shape, dim, use_time_as_channels=False, stride=None,
-                 rejection_threshold=0.001, folders=None, transforms='all_affinities'):
+                 rejection_threshold=0.01, folders=None, transforms='all_affinities'):
 
         data_filename = str(Path(root_folder).joinpath(h5file))
 
@@ -562,8 +562,16 @@ class CTCAffinityDataset(ZipReject):
         if stride is None:
             stride = [max(s // 2, 1) for s in shape]
 
+        if h5file.endswith("h5"):
+            loader_class = LazyHDF5VolumeLoader
+        elif h5file.endswith("n5"):
+            print("Using N5 loader")
+            loader_class = LazyN5VolumeLoader
+        else:
+            raise NotImplementedError()
+
         raw_ds = MergeDataset(
-            LazyHDF5VolumeLoader(data_filename, f'{f}/raw',
+            loader_class(data_filename, f'{f}/raw',
                                  window_size=shape,
                                  stride=stride,
                                  padding=None,
@@ -571,7 +579,7 @@ class CTCAffinityDataset(ZipReject):
             for f in folders)
 
         segmentatoin_ds = MergeDataset(
-            LazyHDF5VolumeLoader(data_filename, f'{f}/tracklet_seg',
+            loader_class(data_filename, f'{f}/tracklet_seg',
                                  window_size=shape,
                                  stride=stride,
                                  padding=None,
