@@ -47,6 +47,30 @@ def get_transforms(transforms, dim, output_size, crop=True):
             transform.add(RandomCrop(output_size))
         transform.add(AsTorchBatch(dim))
 
+    elif transforms == '3d_affinities':
+
+        offsets = [[-1, 0, 0], [0, -1, 0], [0, 0, -1],
+                   [-1, -4, -4], [-1, 4, 4],
+                   [-1, -4, 4], [-1, 4, -4],
+                   [-2, 0, 0],
+                   [0, -9, 0], [0, 0, -9],
+                   [0, -9, -9], [0, 9, -9],
+                   [0, -9, -4], [0, -4, -9], [0, 4, -9], [0, 9, -4],
+                   [0, -27, 0], [0, 0, -27], [0, -56, 0], [0, 0, -56]]
+
+        transform = Compose(RandomFlip(),
+                            RandomRotate(),
+                            ElasticTransform(alpha=2000., sigma=50., order=0),
+                            SliceTransform(0, 0, apply_to=[1]),
+                            Segmentation2AffinitiesWithPadding(offsets=offsets,
+                                                               segmentation_to_binary=True,
+                                                               apply_to=[1],
+                                                               ignore_label=-1,
+                                                               retain_segmentation=False))
+        if crop:
+            transform.add(RandomCrop(output_size))
+        transform.add(AsTorchBatch(dim))
+
     elif transforms == 'tracking_affinities':
 
         offsets = [[-1, 0, 0], [0, -1, 0], [0, 0, -1],
@@ -90,7 +114,7 @@ def get_transforms(transforms, dim, output_size, crop=True):
         transform = Compose(RandomFlip(),
                             RandomRotate(),
                             Normalize(apply_to=[0]),
-                            ElasticTransform(alpha=2000., sigma=50., order=0),
+                            # ElasticTransform(alpha=2000., sigma=50., order=0),
                             Segmentation2AffinitiesWithPadding(offsets=offsets,
                                                                segmentation_to_binary=True,
                                                                apply_to=[1],
@@ -349,7 +373,7 @@ class CTCSegmentationDataset(Dataset):
                                    normalize=normalize,
                                    folders=folders)
 
-        self.transform = get_transforms(transforms, dim, output_size, False)
+        self.transform = get_transforms(transforms, dim, output_size, True)
 
         self.output_size = output_size
 
@@ -360,9 +384,9 @@ class CTCSegmentationDataset(Dataset):
         img, gt = self.data.get_segmentation(idx)
         img, gt = img.astype(np.float32), gt.astype(np.float32)
         if self.transform is not None:
-            img, gt = self.transform(img, gt)
+            img, gt = self.transform(img.astype(np.float32), gt.astype(np.int64))
 
-        return img[0], gt[0]
+        return img, gt
 
 
 class CTCDataset(CTCSegmentationDataset):
@@ -525,6 +549,10 @@ class RejectFewInstances(object):
         ratio = ((fetched > 0).sum() / fetched.size)
         return ratio < self.threshold
 
+class RejectNothing(object):
+    def __call__(self, fetched):
+        return False
+
 
 # TODO: move this into inferno???
 class MergeDataset(Dataset):
@@ -551,7 +579,7 @@ class MergeDataset(Dataset):
 class CTCAffinityDataset(ZipReject):
 
     def __init__(self, root_folder, h5file, shape, dim, use_time_as_channels=False, stride=None,
-                 rejection_threshold=0.01, folders=None, transforms='all_affinities'):
+                 rejection_threshold=0.06, folders=None, transforms='all_affinities'):
 
         data_filename = str(Path(root_folder).joinpath(h5file))
 
@@ -566,24 +594,24 @@ class CTCAffinityDataset(ZipReject):
             loader_class = LazyHDF5VolumeLoader
         elif h5file.endswith("n5"):
             print("Using N5 loader")
-            loader_class = LazyN5VolumeLoader
+            loader_class = HDF5VolumeLoader
         else:
             raise NotImplementedError()
 
         raw_ds = MergeDataset(
             loader_class(data_filename, f'{f}/raw',
-                                 window_size=shape,
-                                 stride=stride,
-                                 padding=None,
-                                 padding_mode='constant')
+                         window_size=shape,
+                         stride=stride,
+                         padding=None,
+                         padding_mode='constant')
             for f in folders)
 
         segmentatoin_ds = MergeDataset(
             loader_class(data_filename, f'{f}/tracklet_seg',
-                                 window_size=shape,
-                                 stride=stride,
-                                 padding=None,
-                                 padding_mode='constant')
+                         window_size=shape,
+                         stride=stride,
+                         padding=None,
+                         padding_mode='constant')
             for f in folders)
 
         batch_dim = dim
@@ -594,9 +622,14 @@ class CTCAffinityDataset(ZipReject):
 
         self.transform = get_transforms(transforms, batch_dim, None, crop=False)
 
+        if threshold == 0.:
+            rj = RejectNothing()
+        else:
+            rj = RejectFewInstances(rejection_threshold)
+
         super(CTCAffinityDataset, self).__init__(raw_ds, segmentatoin_ds,
                                                  rejection_dataset_indices=1,
-                                                 rejection_criterion=RejectFewInstances(rejection_threshold),
+                                                 rejection_criterion=rj,
                                                  sync=True)
 
     def __getitem__(self, idx):
@@ -604,7 +637,7 @@ class CTCAffinityDataset(ZipReject):
         img, gt = super(CTCAffinityDataset, self).__getitem__(idx)
 
         if self.transform is not None:
-            img, gt = self.transform(img, gt.astype(np.int64))
+            img, gt = self.transform(img.astype(np.float32), gt.astype(np.int64))
 
         return img.type(torch.FloatTensor), gt.type(torch.FloatTensor)
 
