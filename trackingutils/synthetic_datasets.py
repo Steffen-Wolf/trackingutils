@@ -5,13 +5,12 @@ from inferno.io.transform.generic import AsTorchBatch
 from inferno.io.transform.image import RandomFlip, RandomCrop
 from inferno.io.transform.generic import Normalize
 from inferno.io.transform.image import RandomRotate, ElasticTransform
-from neurofire.transform.affinities import Segmentation2Affinities2D, Segmentation2Affinities
+# from neurofire.transform.affinities import Segmentation2Affinities2D, Segmentation2Affinities
 from inferno.io.volumetric import LazyHDF5VolumeLoader, HDF5VolumeLoader, LazyN5VolumeLoader
-from neurofire.criteria.loss_transforms import MaskTransitionToIgnoreLabel
-from neurofire.criteria.loss_transforms import InvertTarget
+# from neurofire.criteria.loss_transforms import MaskTransitionToIgnoreLabel
+# from neurofire.criteria.loss_transforms import InvertTarget
 from embeddingutils.transforms import Segmentation2AffinitiesWithPadding
 from pathlib import Path
-from .transforms import SliceTransform
 import h5py
 import torch
 import numpy as np
@@ -74,7 +73,6 @@ class MovingMnist(Dataset):
                  image_shape=(64, 64), digit_shape=(28, 28)):
         self.epoch_length = fake_dataset_size
         self.seq_len = seq_len
-        self.mnist = load_dataset()
         self.nums_per_image = nums_per_image
         self.img_shape = image_shape
         self.digit_shape = digit_shape
@@ -93,11 +91,12 @@ class MovingMnist(Dataset):
                                                                                       speeds)]
 
     def initialize_sprites(self, moving_objects):
-        moving_objects["mnist_images"] = [self.mnist[r]
+        self.mnist = load_dataset()
+        moving_objects["sprite_images"] = [self.mnist[r]
                                           for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
 
     def render_frame(self, frame_array, moving_objects):
-        for i, digit in enumerate(moving_objects["mnist_images"]):
+        for i, digit in enumerate(moving_objects["sprite_images"]):
             x, y = int(moving_objects["positions"][i][0]), int(moving_objects["positions"][i][1])
             frame_array[x:x + self.digit_shape[0], y:y + self.digit_shape[1]] += digit[0]
 
@@ -119,15 +118,13 @@ class MovingMnist(Dataset):
                                                        moving_objects["veloc"])]
 
     def update_sprites(self, moving_objects):
-        pass                  
+        pass
 
     def __getitem__(self, index):
         moving_objects = {}
         self.initialize_positions(moving_objects)
         self.initialize_movement(moving_objects)
         self.initialize_sprites(moving_objects)
-
-        self.get_moving_sprites()
 
         data = np.zeros((self.seq_len, 64, 64))
 
@@ -144,10 +141,40 @@ class MovingMnist(Dataset):
 
 class MovingShapes(MovingMnist):
 
+    def get_random_shape(self, noise_stength=4., ):
+        import PIL.ImageDraw as ImageDraw
+        import PIL.Image as Image
+
+        image = Image.new("L", (128, 128))
+
+        draw = ImageDraw.Draw(image)
+
+        # define the base polygon
+        points = np.array([[64, 16], [64 - 8, 64], [64, 128 - 16], [64 + 8, 64]], dtype=np.float32)
+        # shift to com
+        points -= 64
+
+        # add random perturbations
+        points += noise_stength * np.random.rand(*points.shape)
+
+        # rotate by a random angle
+        theta = 2 * np.random.rand() * np.pi
+        rotMatrix = np.array([[np.cos(theta), -np.sin(theta)],
+                              [np.sin(theta),  np.cos(theta)]])
+        points = rotMatrix.dot(points.T).T
+
+        # shift back to center of image
+        points += 64
+
+        draw.polygon(tuple(map(tuple, points)), fill=100)
+        image.show()
+        print(np.array(image).shape)
+
     def initialize_sprites(self, moving_objects):
-        moving_objects["mnist_images"] = [self.mnist[r]
-                                          for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
+        moving_objects["sprite_images"] = [self.get_random_shape()
+                                          for i in range(self.nums_per_image)]
 
 
 if __name__ == '__main__':
+    MovingShapes()[0]
     pass
