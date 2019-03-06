@@ -166,9 +166,10 @@ class MovingShapes(MovingMnist):
         # shift back to center of image
         points += 64
 
-        draw.polygon(tuple(map(tuple, points)), fill=100)
+        draw.polygon(tuple(map(tuple, points)), fill=np.random.randint(50, 255))
         image.show()
         print(np.array(image).shape)
+        return np.array(image) / 255.
 
     def initialize_sprites(self, moving_objects):
         moving_objects["sprite_images"] = [self.get_random_shape()
