@@ -96,9 +96,32 @@ class MovingMnist(Dataset):
         moving_objects["mnist_images"] = [self.mnist[r]
                                           for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
 
-    def __getitem__(self, index):
-        # randomly generate direc/speed/position, calculate velocity vector
+    def render_frame(self, frame_array, moving_objects):
+        for i, digit in enumerate(moving_objects["mnist_images"]):
+            x, y = int(moving_objects["positions"][i][0]), int(moving_objects["positions"][i][1])
+            frame_array[x:x + self.digit_shape[0], y:y + self.digit_shape[1]] += digit[0]
 
+    def update_positions(self, moving_objects):
+        # update positions based on velocity
+        next_pos = [list(map(sum, zip(p, v))) for p, v in zip(moving_objects["positions"],
+                                                              moving_objects["veloc"])]
+        # bounce off wall if a we hit one
+        for i, pos in enumerate(next_pos):
+            for j, coord in enumerate(pos):
+                if coord < 0 or coord > self.lims[j]:
+                    moving_objects["veloc"][i] = tuple(
+                        list(moving_objects["veloc"][i][:j]) +
+                        [-1 * moving_objects["veloc"][i][j]] +
+                        list(moving_objects["veloc"][i][j + 1:]))
+
+        moving_objects["positions"] = [list(map(sum, zip(p, v)))
+                                       for p, v in zip(moving_objects["positions"],
+                                                       moving_objects["veloc"])]
+
+    def update_sprites(self, moving_objects):
+        pass                  
+
+    def __getitem__(self, index):
         moving_objects = {}
         self.initialize_positions(moving_objects)
         self.initialize_movement(moving_objects)
@@ -109,26 +132,21 @@ class MovingMnist(Dataset):
         data = np.zeros((self.seq_len, 64, 64))
 
         for frame_idx in range(self.seq_len):
-            for i, digit in enumerate(moving_objects["mnist_images"]):
-                x, y = int(moving_objects["positions"][i][0]), int(moving_objects["positions"][i][1])
-                data[frame_idx, x:x + self.digit_shape[0], y:y + self.digit_shape[1]] += digit[0]
-
-            # update positions based on velocity
-            next_pos = [list(map(sum, zip(p, v))) for p, v in zip(moving_objects["positions"], moving_objects["veloc"])]
-            # bounce off wall if a we hit one
-            for i, pos in enumerate(next_pos):
-                for j, coord in enumerate(pos):
-                    if coord < 0 or coord > self.lims[j]:
-                        moving_objects["veloc"][i] = tuple(
-                            list(moving_objects["veloc"][i][:j]) + [-1 * moving_objects["veloc"][i][j]] + list(moving_objects["veloc"][i][j + 1:]))
-
-            moving_objects["positions"] = [list(map(sum, zip(p, v)))
-                                           for p, v in zip(moving_objects["positions"], moving_objects["veloc"])]
+            self.render_frame(data[frame_idx], moving_objects)
+            self.update_positions(moving_objects)
+            self.update_sprites(moving_objects)
 
         return np.clip(data, 0, 1)
 
     def __len__(self):
         return self.epoch_length
+
+
+class MovingShapes(MovingMnist):
+
+    def initialize_sprites(self, moving_objects):
+        moving_objects["mnist_images"] = [self.mnist[r]
+                                          for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
 
 
 if __name__ == '__main__':
