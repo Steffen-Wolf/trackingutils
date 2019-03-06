@@ -21,6 +21,7 @@ import sys
 import os
 import math
 
+
 ###########################################################################################
 # script to generate moving mnist video dataset (frame by frame) as described in
 # [1] arXiv:1502.04681 - Unsupervised Learning of Video Representations Using LSTMs
@@ -45,6 +46,7 @@ def get_picture_array(X, index, shift=0):
         ret = ret.reshape(h, w)
     return ret
 
+
 def load_dataset():
     if sys.version_info[0] == 2:
         from urllib import urlretrieve
@@ -66,41 +68,62 @@ def load_dataset():
     return load_mnist_images('train-images-idx3-ubyte.gz')
 
 
-class MovingMnist(data.Dataset):
+class MovingMnist(Dataset):
 
-    def __init__(self, seq_len=20, nums_per_image=2, fake_dataset_size=1000):
+    def __init__(self, seq_len=20, nums_per_image=2, fake_dataset_size=1000,
+                 image_shape=(64, 64), digit_shape=(28, 28)):
         self.epoch_length = fake_dataset_size
         self.seq_len = seq_len
         self.mnist = load_dataset()
         self.nums_per_image = nums_per_image
-        self.img_shape = (64, 64)
-        self.digit_shape = (28, 28)
+        self.img_shape = image_shape
+        self.digit_shape = digit_shape
         self.x_lim = self.img_shape[0] - self.digit_shape[0]
         self.y_lim = self.img_shape[1] - self.digit_shape[1]
         self.lims = (self.x_lim, self.y_lim)
 
+    def initialize_positions(self, moving_objects):
+        moving_objects["positions"] = [(np.random.rand() * self.x_lim, np.random.rand()
+                                        * self.y_lim) for _ in range(self.nums_per_image)]
+
+    def initialize_movement(self, moving_objects):
+        directions = np.pi * (np.random.rand(self.nums_per_image) * 2 - 1)
+        speeds = np.random.randint(5, size=self.nums_per_image) + 2
+        moving_objects["veloc"] = [(v * math.cos(d), v * math.sin(d)) for d, v in zip(directions,
+                                                                                      speeds)]
+
+    def initialize_sprites(self, moving_objects):
+        moving_objects["mnist_images"] = [self.mnist[r]
+                                          for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
+
     def __getitem__(self, index):
         # randomly generate direc/speed/position, calculate velocity vector
-        direcs = np.pi * (np.random.rand(self.nums_per_image) * 2 - 1)
-        speeds = np.random.randint(5, size=self.nums_per_image) + 2
-        veloc = [(v * math.cos(d), v * math.sin(d)) for d, v in zip(direcs, speeds)]
-        mnist_images = [self.mnist[r] for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
-        positions = [(np.random.rand() * self.x_lim, np.random.rand() * self.y_lim) for _ in range(self.nums_per_image)]
+
+        moving_objects = {}
+        self.initialize_positions(moving_objects)
+        self.initialize_movement(moving_objects)
+        self.initialize_sprites(moving_objects)
+
+        self.get_moving_sprites()
 
         data = np.zeros((self.seq_len, 64, 64))
 
         for frame_idx in range(self.seq_len):
-            for i, digit in enumerate(mnist_images):
-                x, y = int(positions[i][0]), int(positions[i][1])
+            for i, digit in enumerate(moving_objects["mnist_images"]):
+                x, y = int(moving_objects["positions"][i][0]), int(moving_objects["positions"][i][1])
                 data[frame_idx, x:x + self.digit_shape[0], y:y + self.digit_shape[1]] += digit[0]
+
             # update positions based on velocity
-            next_pos = [list(map(sum, zip(p, v))) for p, v in zip(positions, veloc)]
+            next_pos = [list(map(sum, zip(p, v))) for p, v in zip(moving_objects["positions"], moving_objects["veloc"])]
             # bounce off wall if a we hit one
             for i, pos in enumerate(next_pos):
                 for j, coord in enumerate(pos):
                     if coord < 0 or coord > self.lims[j]:
-                        veloc[i] = tuple(list(veloc[i][:j]) + [-1 * veloc[i][j]] + list(veloc[i][j + 1:]))
-            positions = [list(map(sum, zip(p, v))) for p, v in zip(positions, veloc)]
+                        moving_objects["veloc"][i] = tuple(
+                            list(moving_objects["veloc"][i][:j]) + [-1 * moving_objects["veloc"][i][j]] + list(moving_objects["veloc"][i][j + 1:]))
+
+            moving_objects["positions"] = [list(map(sum, zip(p, v)))
+                                           for p, v in zip(moving_objects["positions"], moving_objects["veloc"])]
 
         return np.clip(data, 0, 1)
 
