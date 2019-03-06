@@ -588,13 +588,14 @@ class CTCAffinityDataset(ZipReject):
                 folders = [k for k in h5file.keys()]
 
         if stride is None:
-            stride = [max(s // 2, 1) for s in shape]
+            stride = [max(s // 4, 1) for s in shape]
 
         if h5file.endswith("h5"):
-            loader_class = LazyHDF5VolumeLoader
+            loader_class = HDF5VolumeLoader
         elif h5file.endswith("n5"):
             print("Using N5 loader")
-            loader_class = HDF5VolumeLoader
+            # loader_class = HDF5VolumeLoader
+            loader_class = LazyN5VolumeLoader
         else:
             raise NotImplementedError()
 
@@ -622,7 +623,7 @@ class CTCAffinityDataset(ZipReject):
 
         self.transform = get_transforms(transforms, batch_dim, None, crop=False)
 
-        if threshold == 0.:
+        if rejection_threshold == 0.:
             rj = RejectNothing()
         else:
             rj = RejectFewInstances(rejection_threshold)
