@@ -11,11 +11,15 @@ from neurofire.criteria.loss_transforms import MaskTransitionToIgnoreLabel
 from neurofire.criteria.loss_transforms import InvertTarget
 from embeddingutils.transforms import Segmentation2AffinitiesWithPadding
 from pathlib import Path
-from .transforms import SliceTransform
+from trackingutils.transforms import SliceTransform
 import h5py
 import torch
 import numpy as np
 import vigra
+import random
+from scipy import ndimage
+from scipy.ndimage.filters import gaussian_filter
+from scipy.ndimage.interpolation import map_coordinates
 
 
 def get_transforms(transforms, dim, output_size, crop=True):
@@ -262,9 +266,9 @@ class CTCDataWrapper():
                     img = h5file["exported_data"][..., 1]
             else:
                 if self.load_3d:
-                    img = vigra.impex.readVolume(str(file_name)).transpose(3, 2, 1, 0)
+                    img = np.array(vigra.impex.readVolume(str(file_name)).transpose(3, 2, 1, 0))
                 else:
-                    img = vigra.impex.readImage(str(file_name)).transpose(2, 1, 0)
+                    img = np.array(vigra.impex.readImage(str(file_name)).transpose(2, 1, 0))
 
             if select_z is not None:
                 img = img[:, select_z]
@@ -549,7 +553,9 @@ class RejectFewInstances(object):
         ratio = ((fetched > 0).sum() / fetched.size)
         return ratio < self.threshold
 
+
 class RejectNothing(object):
+
     def __call__(self, fetched):
         return False
 
@@ -643,23 +649,109 @@ class CTCAffinityDataset(ZipReject):
         return img.type(torch.FloatTensor), gt.type(torch.FloatTensor)
 
 
+def get_random_flow(imshape):
+    alpha = 2000.
+    sigma = 50.
+    np.random.seed()
+    # Build and scale random fields
+    random_field_x = np.random.uniform(-1, 1, imshape) * alpha
+    random_field_y = np.random.uniform(-1, 1, imshape) * alpha
+    # Smooth random field (this has to be done just once per reset)
+    sdx = gaussian_filter(random_field_x, sigma, mode='reflect')
+    sdy = gaussian_filter(random_field_y, sigma, mode='reflect')
+    # Make meshgrid
+    x, y = np.meshgrid(np.arange(imshape[1]), np.arange(imshape[0]))
+    # Make inversion coefficient
+    _inverter = 1.
+    # Distort meshgrid indices (invert if required)
+    flow_y, flow_x = (y + _inverter * sdy).reshape(-1, 1), (x + _inverter * sdx).reshape(-1, 1)
+    # Set random states
+    print(flow_x.shape)
+    flows = np.stack((y.reshape(-1, 1) - flow_y, x.reshape(-1, 1) - flow_x),
+                     axis=0).reshape([-1, imshape[0], imshape[1]])
+    return np.stack((flow_y, flow_x), axis=0), flows
+
+
+class CTCFlowDataset(CTCSegmentationDataset):
+
+    def __len__(self):
+        return self.data.len_images()
+
+    def __getitem__(self, idx):
+        img_full, gt_full = self.data.get_allimages(idx)
+
+        img0 = img_full.copy()
+        # random point to paste the cell to
+        shift_coord, flows = get_random_flow(img_full.shape[1:])
+        img1 = map_coordinates(img_full[0], shift_coord, mode='reflect', order=0).reshape(img_full.shape)
+
+        # load a single cell
+        for i in range(3):
+            seg_idx = random.randint(0, self.data.len_segmentation())
+            img, gt = self.data.get_segmentation(seg_idx)
+
+            random_cell_idx = random.randint(1, gt.max())
+            copy_slices = ndimage.find_objects(gt == random_cell_idx)[0][1:]
+            copy_mask = (gt == random_cell_idx)[0][copy_slices]
+
+            fs = img_full.shape[1:]
+            box_sizes = tuple(copy_slices[i].stop - copy_slices[i].start
+                              for i in range(len(fs)))
+            max_offsets = tuple(fs[i] - box_sizes[i]
+                                for i in range(len(fs)))
+
+            # TODO: keep cells on the boundary
+            not_boundary = tuple(True for cs in copy_slices)
+            # not_boundary = tuple(cs.start != 0 and cs.stop < img_full.shape cs in copy_slices)
+            # def random_coord():
+            #     not_boundary
+            rp = tuple(random.randint(0, mo) for mo in max_offsets)
+
+
+            # draw random vector for cell shift
+            cell_shift_vector = tuple(not_boundary[i] * random.randint(-15, 15) for i in range(len(fs)))
+
+            paste_slices_source = (slice(None),) + \
+                tuple(slice(rp[i], rp[i] + box_sizes[i]) for i in range(len(rp)))
+
+            paste_slices_target = (slice(None),) + \
+                tuple(slice(cell_shift_vector[i] + rp[i],
+                            cell_shift_vector[i] + rp[i] + box_sizes[i])
+                      for i in range(len(rp)))
+
+            for i, s in enumerate(cell_shift_vector):
+                flows[i][paste_slices_source[1:]][copy_mask] = s
+
+            print(paste_slices_source)
+            print(paste_slices_target, img0.shape, img.shape, copy_slices)
+            img0[paste_slices_source][0][copy_mask] = img[(0,) + copy_slices][copy_mask]
+            img1[paste_slices_target][0][copy_mask] = img[(0,) + copy_slices][copy_mask]
+
+        with h5py.File("debug3.h5", "w") as h5file:
+            h5file.create_dataset("data", data=np.stack((img_full, img0, img1), axis=-1)[0])
+            h5file.create_dataset("flows", data=flows)
+
+        return np.stack((img0, img1)), flows
+
+
 if __name__ == '__main__':
 
-    # ds = CTCSegmentationDataset("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC",
-    #                             dim=3,
-    #                             slice_z=True,
-    #                             output_size=(512, 512))
+    ds = CTCFlowDataset("/mnt/data1/swolf/CTC/DIC-C2DH-HeLa",
+                        dim=2,
+                        output_size=(512, 512))
+
+    print(ds[0])
 
     # print("ds size ", len(ds))
     # for i, (img, seg) in enumerate(ds):
     #     print(img.shape, seg.shape)
     # shape = [8, 512, 512]
 
-    HDF5VolumeLoader("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC/data.h5", '02/raw',
-                     window_size=[4, 13, 256, 256],
-                     stride=[1, 1, 128, 128],
-                     padding=None,
-                     padding_mode='constant')
+    # HDF5VolumeLoader("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC/data.h5", '02/raw',
+    #                  window_size=[4, 13, 256, 256],
+    #                  stride=[1, 1, 128, 128],
+    #                  padding=None,
+    #                  padding_mode='constant')
 
     # ds = CTCAffinityDataset("/mnt/data1/swolf/CTC/Fluo-N3DL-TRIC",
     #                         shape=[4, 13, 256, 256],
