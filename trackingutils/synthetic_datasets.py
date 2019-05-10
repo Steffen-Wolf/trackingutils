@@ -70,7 +70,7 @@ def load_dataset():
 class MovingMnist(Dataset):
 
     def __init__(self, seq_len=20, nums_per_image=2, fake_dataset_size=1000,
-                 image_shape=(64, 64), digit_shape=(28, 28)):
+                 image_shape=(256, 256), digit_shape=(28, 28)):
         self.epoch_length = fake_dataset_size
         self.seq_len = seq_len
         self.nums_per_image = nums_per_image
@@ -93,11 +93,12 @@ class MovingMnist(Dataset):
     def initialize_sprites(self, moving_objects):
         self.mnist = load_dataset()
         moving_objects["sprite_images"] = [self.mnist[r]
-                                          for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
+                                           for r in np.random.randint(0, self.mnist.shape[0], self.nums_per_image)]
 
     def render_frame(self, frame_array, moving_objects):
         for i, digit in enumerate(moving_objects["sprite_images"]):
             x, y = int(moving_objects["positions"][i][0]), int(moving_objects["positions"][i][1])
+            print(frame_array.shape, x, x + self.digit_shape[0], y, y + self.digit_shape[1])
             frame_array[x:x + self.digit_shape[0], y:y + self.digit_shape[1]] += digit[0]
 
     def update_positions(self, moving_objects):
@@ -126,7 +127,7 @@ class MovingMnist(Dataset):
         self.initialize_movement(moving_objects)
         self.initialize_sprites(moving_objects)
 
-        data = np.zeros((self.seq_len, 64, 64))
+        data = np.zeros((self.seq_len, self.img_shape[0], self.img_shape[1]))
 
         for frame_idx in range(self.seq_len):
             self.render_frame(data[frame_idx], moving_objects)
@@ -141,18 +142,24 @@ class MovingMnist(Dataset):
 
 class MovingShapes(MovingMnist):
 
-    def get_random_shape(self, noise_stength=4., ):
+    def get_random_shape(self, noise_stength=3., mean_intensiy=100):
         import PIL.ImageDraw as ImageDraw
         import PIL.Image as Image
 
-        image = Image.new("L", (128, 128))
+        image = Image.new("L", self.digit_shape)
 
         draw = ImageDraw.Draw(image)
 
         # define the base polygon
-        points = np.array([[64, 16], [64 - 8, 64], [64, 128 - 16], [64 + 8, 64]], dtype=np.float32)
+        max_x, max_y = self.digit_shape
+        points = np.array([[max_x // 2, max_y // 8],
+                           [max_y // 2 - max_y // 16, max_y // 2],
+                           [max_x // 2, max_y - max_y // 8],
+                           [max_x // 2 + max_y // 16, max_y // 2]],
+                          dtype=np.float32)
         # shift to com
-        points -= 64
+        points[:, 0] -= max_x // 2
+        points[:, 1] -= max_y // 2
 
         # add random perturbations
         points += noise_stength * np.random.rand(*points.shape)
@@ -164,18 +171,58 @@ class MovingShapes(MovingMnist):
         points = rotMatrix.dot(points.T).T
 
         # shift back to center of image
-        points += 64
+        points[:, 0] += max_x // 2
+        points[:, 1] += max_y // 2
 
-        draw.polygon(tuple(map(tuple, points)), fill=np.random.randint(50, 255))
-        image.show()
-        print(np.array(image).shape)
+        draw.polygon(tuple(map(tuple, points)),
+                     fill=int(np.random.normal(loc=mean_intensiy, scale=5.0)))
+
         return np.array(image) / 255.
 
     def initialize_sprites(self, moving_objects):
         moving_objects["sprite_images"] = [self.get_random_shape()
-                                          for i in range(self.nums_per_image)]
+                                           for i in range(self.nums_per_image)]
 
+
+class MovingShapesUnsupervised(MovingMnist):
+    def __getitem__(self, index):
+        out = super().__getitem__(index).astype(np.float32)
+        return out[None], np.stack(out, (out > 0).astype(np.float32))
 
 if __name__ == '__main__':
-    MovingShapes()[0]
-    pass
+    from ctctracking.loss import UnsupervisedLoss
+
+    ms = MovingShapes(image_shape=(256, 256), digit_shape=(128, 128))
+
+    model_parameters = {}
+    model_parameters["self_mean"] = [0, 0, 0, 0, 0, 0, 0, 0]
+    model_parameters["self_std"] = [0, 0, 0, 0, 0, 0, 0, 0]
+    model_parameters["self_keys"] = ["size", "avg_int", "moment_of_inertia", "maxdist", "Q_00", "Q_01", "Q_11"]
+    model_parameters["self_cov"] = [[0]]
+
+    model_parameters["pair_mean"] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    model_parameters["pair_std"] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    model_parameters["pair_keys"] = ["size", "avg_int", "com_1",
+                                     "com_0", "moment_of_inertia", "maxdist", "Q_00", "Q_01", "Q_11"]
+    model_parameters["pair_cov"] = [[0]]
+
+    usl = UnsupervisedLoss("", dim=2,
+                           fov=[64, 64],
+                           n_samples=20,
+                           scale=.01,
+                           model_parameters=model_parameters)
+
+    feat = []
+
+    for k in range(100):
+        image_window = ms.get_random_shape()
+        p_incluster = image_window > 0
+        print(p_incluster.sum())
+        feat.append(usl.computed_self_features(torch.from_numpy(image_window.astype(np.float32)),
+                                               torch.from_numpy(p_incluster.astype(np.float32))))
+
+    feat = np.stack(feat)
+    print(feat.shape)
+
+    print(",".join([str(x) for x in np.mean(feat, axis=0)]))
+    print(",".join([str(x) for x in np.std(feat, axis=0)]))
