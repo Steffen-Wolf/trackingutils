@@ -685,6 +685,8 @@ class CTCFlowDataset(CTCSegmentationDataset):
         shift_coord, flows = get_random_flow(img_full.shape[1:])
         img1 = map_coordinates(img_full[0], shift_coord, mode='reflect', order=0).reshape(img_full.shape)
 
+        flow_mask = np.zeros(flows.shape)
+
         # load a single cell
         for i in range(3):
             seg_idx = random.randint(0, self.data.len_segmentation())
@@ -727,11 +729,25 @@ class CTCFlowDataset(CTCSegmentationDataset):
             img0[paste_slices_source][0][copy_mask] = img[(0,) + copy_slices][copy_mask]
             img1[paste_slices_target][0][copy_mask] = img[(0,) + copy_slices][copy_mask]
 
-        with h5py.File("debug3.h5", "w") as h5file:
-            h5file.create_dataset("data", data=np.stack((img_full, img0, img1), axis=-1)[0])
-            h5file.create_dataset("flows", data=flows)
+            current_occlusion = np.ones(flow_mask.shape)
 
-        return np.stack((img0, img1)), flows
+            for d in range(2):
+                current_occlusion[d][paste_slices_source[1:]][copy_mask] = 2
+                current_occlusion[d][paste_slices_target[1:]][copy_mask] -= 2
+            # flow_mask += 
+            # flow_mask += 
+
+            flow_mask[current_occlusion == 0] = 0
+            flow_mask[current_occlusion == 2] = 0
+            flow_mask[current_occlusion == -1] = 1
+
+
+        # with h5py.File("debug3.h5", "w") as h5file:
+        #     h5file.create_dataset("data", data=np.stack((img_full, img0, img1), axis=-1)[0])
+        #     h5file.create_dataset("flows", data=flows)
+        #     h5file.create_dataset("flow_mask", data=flow_mask)
+
+        return np.stack((img0, img1)), flows, flow_mask
 
 
 if __name__ == '__main__':
