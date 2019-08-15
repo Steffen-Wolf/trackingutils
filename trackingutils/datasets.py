@@ -133,7 +133,8 @@ def get_transforms(transforms, dim, output_size, crop=True):
     elif transforms == 'minimal':
         transform = Compose()
         if crop:
-            transform.add(AsTorchBatch(dim))
+            transform.add(RandomCrop(output_size))
+        # transform.add(AsTorchBatch(dim))
     elif transforms == "no":
         transform = None
     else:
@@ -582,9 +583,57 @@ class MergeDataset(Dataset):
         return self.datasets[d_idx].__getitem__(sub_idx)
 
 
+class MultiKeyDataset(Zip):
+
+    def __init__(self, h5file, shape, dim, use_time_as_channels=False, stride=None,
+                 rejection_threshold=0.06, folders=None, zip_keys=("raw", "tracklet_seg")):
+
+        data_filename = str(Path(root_folder).joinpath(h5file))
+
+        if merge_keys is None:
+            with h5py.File(data_filename, "r") as h5file:
+                merge_keys = [k for k in h5file.keys()]
+
+        if stride is None:
+            stride = [max(s // 4, 1) for s in shape]
+
+        if h5file.endswith("h5"):
+            loader_class = HDF5VolumeLoader
+        elif h5file.endswith("n5"):
+            print("Using N5 loader")
+            loader_class = HDF5VolumeLoader
+        else:
+            raise NotImplementedError()
+
+        datasets = (MergeDataset(
+            loader_class(data_filename, f'{f}/{ds_name}',
+                         window_size=shape,
+                         stride=stride,
+                         padding=None,
+                         padding_mode='constant')
+            for f in merge_keys) for ds_name in merge_keys)
+
+        batch_dim = dim
+        if use_time_as_channels:
+            batch_dim -= 1
+
+        self.use_time_as_channels = use_time_as_channels
+
+        super(CTCAffinityDataset, self).__init__(*datasets,
+                                                 rejection_dataset_indices=1,
+                                                 rejection_criterion=rj,
+                                                 sync=True)
+
+
+# class :
+#         # if self.transform is not None:
+#         #     img, gt = self.transform(img.astype(np.float32), gt.astype(np.int64))
+#         # self.transform = get_transforms(transforms, batch_dim, None, crop=False)
+#         return img.type(torch.FloatTensor), gt.type(torch.FloatTensor)
+
 class CTCAffinityDataset(ZipReject):
 
-    def __init__(self, root_folder, h5file, shape, dim, use_time_as_channels=False, stride=None,
+    def __init__(self, root_folder, h5file, shape, dim, dataset_keys=("raw", "tracklet_seg"), use_time_as_channels=False, stride=None,
                  rejection_threshold=0.06, folders=None, transforms='all_affinities'):
 
         data_filename = str(Path(root_folder).joinpath(h5file))
@@ -600,26 +649,17 @@ class CTCAffinityDataset(ZipReject):
             loader_class = HDF5VolumeLoader
         elif h5file.endswith("n5"):
             print("Using N5 loader")
-            # loader_class = HDF5VolumeLoader
-            loader_class = LazyN5VolumeLoader
+            loader_class = HDF5VolumeLoader
         else:
             raise NotImplementedError()
 
-        raw_ds = MergeDataset(
-            loader_class(data_filename, f'{f}/raw',
+        datasets = (MergeDataset(
+            loader_class(data_filename, f'{f}/{ds_name}',
                          window_size=shape,
                          stride=stride,
                          padding=None,
                          padding_mode='constant')
-            for f in folders)
-
-        segmentatoin_ds = MergeDataset(
-            loader_class(data_filename, f'{f}/tracklet_seg',
-                         window_size=shape,
-                         stride=stride,
-                         padding=None,
-                         padding_mode='constant')
-            for f in folders)
+            for f in folders) for ds_name in dataset_keys)
 
         batch_dim = dim
         if use_time_as_channels:
@@ -634,7 +674,7 @@ class CTCAffinityDataset(ZipReject):
         else:
             rj = RejectFewInstances(rejection_threshold)
 
-        super(CTCAffinityDataset, self).__init__(raw_ds, segmentatoin_ds,
+        super(CTCAffinityDataset, self).__init__(*datasets,
                                                  rejection_dataset_indices=1,
                                                  rejection_criterion=rj,
                                                  sync=True)
@@ -649,9 +689,9 @@ class CTCAffinityDataset(ZipReject):
         return img.type(torch.FloatTensor), gt.type(torch.FloatTensor)
 
 
-def get_random_flow(imshape):
-    alpha = 2000.
-    sigma = 50.
+
+
+def get_random_flow(imshape, alpha=2000., sigma=50.):
     np.random.seed()
     # Build and scale random fields
     random_field_x = np.random.uniform(-1, 1, imshape) * alpha
@@ -666,7 +706,6 @@ def get_random_flow(imshape):
     # Distort meshgrid indices (invert if required)
     flow_y, flow_x = (y + _inverter * sdy).reshape(-1, 1), (x + _inverter * sdx).reshape(-1, 1)
     # Set random states
-    print(flow_x.shape)
     flows = np.stack((y.reshape(-1, 1) - flow_y, x.reshape(-1, 1) - flow_x),
                      axis=0).reshape([-1, imshape[0], imshape[1]])
     return np.stack((flow_y, flow_x), axis=0), flows
@@ -678,22 +717,33 @@ class CTCFlowDataset(CTCSegmentationDataset):
         return self.data.len_images()
 
     def __getitem__(self, idx):
+        max_shift = 15
+
         img_full, gt_full = self.data.get_allimages(idx)
 
         img0 = img_full.copy()
         # random point to paste the cell to
-        shift_coord, flows = get_random_flow(img_full.shape[1:])
+        shift_coord, flows = get_random_flow(img_full.shape[1:],
+                                             alpha=random.randint(200, 3000),
+                                             sigma=random.randint(30, 200))
         img1 = map_coordinates(img_full[0], shift_coord, mode='reflect', order=0).reshape(img_full.shape)
 
         flow_mask = np.zeros(flows.shape)
 
         # load a single cell
         for i in range(3):
-            seg_idx = random.randint(0, self.data.len_segmentation())
+            seg_idx = random.randint(0, self.data.len_segmentation() - 1)
             img, gt = self.data.get_segmentation(seg_idx)
 
-            random_cell_idx = random.randint(1, gt.max())
-            copy_slices = ndimage.find_objects(gt == random_cell_idx)[0][1:]
+            for _ in range(5):
+                random_cell_idx = np.random.choice(np.unique(gt)[1:])
+                fo = ndimage.find_objects(gt == random_cell_idx)
+                if len(fo) > 0:
+                    copy_slices = fo[0][1:]
+                    break
+                else:
+                    print(f"{random_cell_idx}/{gt.max()} not found {(gt == random_cell_idx).sum()}")
+
             copy_mask = (gt == random_cell_idx)[0][copy_slices]
 
             fs = img_full.shape[1:]
@@ -707,11 +757,10 @@ class CTCFlowDataset(CTCSegmentationDataset):
             # not_boundary = tuple(cs.start != 0 and cs.stop < img_full.shape cs in copy_slices)
             # def random_coord():
             #     not_boundary
-            rp = tuple(random.randint(0, mo) for mo in max_offsets)
-
+            rp = tuple(random.randint(max_shift, mo - max_shift) for mo in max_offsets)
 
             # draw random vector for cell shift
-            cell_shift_vector = tuple(not_boundary[i] * random.randint(-15, 15) for i in range(len(fs)))
+            cell_shift_vector = tuple(not_boundary[i] * random.randint(-max_shift, max_shift) for i in range(len(fs)))
 
             paste_slices_source = (slice(None),) + \
                 tuple(slice(rp[i], rp[i] + box_sizes[i]) for i in range(len(rp)))
@@ -724,8 +773,6 @@ class CTCFlowDataset(CTCSegmentationDataset):
             for i, s in enumerate(cell_shift_vector):
                 flows[i][paste_slices_source[1:]][copy_mask] = s
 
-            print(paste_slices_source)
-            print(paste_slices_target, img0.shape, img.shape, copy_slices)
             img0[paste_slices_source][0][copy_mask] = img[(0,) + copy_slices][copy_mask]
             img1[paste_slices_target][0][copy_mask] = img[(0,) + copy_slices][copy_mask]
 
@@ -734,21 +781,37 @@ class CTCFlowDataset(CTCSegmentationDataset):
             for d in range(2):
                 current_occlusion[d][paste_slices_source[1:]][copy_mask] = 2
                 current_occlusion[d][paste_slices_target[1:]][copy_mask] -= 2
-            # flow_mask += 
-            # flow_mask += 
+            # flow_mask +=
+            # flow_mask +=
 
             flow_mask[current_occlusion == 0] = 0
             flow_mask[current_occlusion == 2] = 0
             flow_mask[current_occlusion == -1] = 1
-
 
         # with h5py.File("debug3.h5", "w") as h5file:
         #     h5file.create_dataset("data", data=np.stack((img_full, img0, img1), axis=-1)[0])
         #     h5file.create_dataset("flows", data=flows)
         #     h5file.create_dataset("flow_mask", data=flow_mask)
 
-        return np.stack((img0, img1)), flows, flow_mask
+        image_pair = np.concatenate((img0, img1), axis=0)
 
+        # random crop
+        x = random.randint(0, img0.shape[-2] - 512)
+        y = random.randint(0, img0.shape[-1] - 512)
+
+        image_pair = image_pair[:, x:x+512, y:y+512]
+        flows = flows[:, None, x:x+512, y:y+512].astype(np.float32)
+        flow_mask = flow_mask[:, None, x:x+512, y:y+512].astype(np.float32)
+
+
+        return image_pair, flows, flow_mask
+
+
+class CTCCatFlowDataset(torch.utils.data.ConcatDataset):
+
+    def __init__(self, root_folders, *args, **kwargs):
+        datasets = [CTCFlowDataset(r, *args, **kwargs) for r in root_folders]
+        super(CTCCatFlowDataset, self).__init__(datasets)
 
 if __name__ == '__main__':
 
